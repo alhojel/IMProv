@@ -594,6 +594,7 @@ class IMProvPipeline(DiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        d_vec = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -755,100 +756,103 @@ class IMProvPipeline(DiffusionPipeline):
         timesteps = torch.linspace(0, 1, num_inference_steps, device=device)
 
         # 7. Denoising loop
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                # expand the latents if we are doing classifier free guidance
-                token_model_input = (
-                    torch.cat([masked_image_latents] * 2)
-                    if do_classifier_free_guidance
-                    else masked_image_latents
-                )
-                ids_restore = (
-                    torch.cat([ids_restore] * 2) if do_classifier_free_guidance else ids_restore
-                )
+        
+        for i, t in enumerate(timesteps):
+            # expand the latents if we are doing classifier free guidance
+            token_model_input = (
+                torch.cat([masked_image_latents] * 2)
+                if do_classifier_free_guidance
+                else masked_image_latents
+            )
+            ids_restore = (
+                torch.cat([ids_restore] * 2) if do_classifier_free_guidance else ids_restore
+            )
 
-                logits = self.mask_image_model(
-                    token_model_input,
-                    ids_restore=ids_restore,
-                    encoder_hidden_states=prompt_embeds,
-                )
+            self.mask_image_model.forward = forward_specc
 
-                # perform guidance
-                if do_classifier_free_guidance:
-                    logits_uncond, logits = logits.chunk(2)
-                    time_guidance_scale = 1 + t * (guidance_scale - 1)
-                    logits = logits_uncond + time_guidance_scale * (logits - logits_uncond)
+            logits, latents_holder = self.mask_image_model(
+                self.mask_image_model,
+                token_model_input,
+                ids_restore=ids_restore,
+                encoder_hidden_states=prompt_embeds,
+                d_vec = d_vec
+            )
 
-                # [B, L]
-                # TODO: check shape, check need norm or not
-                # Samples the ids using categorical sampling: [batch_size, seq_length].
-                if categorical_sampling:
-                    sampled_image_tokens = torch.distributions.Categorical(logits=logits).sample()
-                else:
-                    sampled_image_tokens = logits.argmax(dim=-1)
+            # perform guidance
+            if do_classifier_free_guidance:
+                logits_uncond, logits = logits.chunk(2)
+                time_guidance_scale = 1 + t * (guidance_scale - 1)
+                logits = logits_uncond + time_guidance_scale * (logits - logits_uncond)
 
-                if image_tokens is None:
-                    image_tokens = sampled_image_tokens
-                else:
-                    # Just updates the masked tokens.
-                    image_tokens = torch.where(unknown_map, sampled_image_tokens, image_tokens)
+            # [B, L]
+            # TODO: check shape, check need norm or not
+            # Samples the ids using categorical sampling: [batch_size, seq_length].
+            if categorical_sampling:
+                sampled_image_tokens = torch.distributions.Categorical(logits=logits).sample()
+            else:
+                sampled_image_tokens = logits.argmax(dim=-1)
 
-                sampled_image_latents = self.patchify(
-                    self.image_encoder(
-                        self.image_decoder(
-                            sampled_image_tokens.view(
-                                batch_size,
-                                height // self.image_decoder.scale_factor,
-                                width // self.image_decoder.scale_factor,
-                            )
+            if image_tokens is None:
+                image_tokens = sampled_image_tokens
+            else:
+                # Just updates the masked tokens.
+                image_tokens = torch.where(unknown_map, sampled_image_tokens, image_tokens)
+
+            sampled_image_latents = self.patchify(
+                self.image_encoder(
+                    self.image_decoder(
+                        sampled_image_tokens.view(
+                            batch_size,
+                            height // self.image_decoder.scale_factor,
+                            width // self.image_decoder.scale_factor,
                         )
                     )
                 )
-                image_latents = torch.where(
-                    unknown_map.unsqueeze(-1), sampled_image_latents, image_latents
-                )
+            )
+            image_latents = torch.where(
+                unknown_map.unsqueeze(-1), sampled_image_latents, image_latents
+            )
 
-                mask_ratio = self.scheduler.schedule_fn(t).item()
+            mask_ratio = self.scheduler.schedule_fn(t).item()
 
-                # [B, L, C]
-                probs = torch.log_softmax(logits, dim=-1)
-                # [B, L]
-                selected_probs = probs.gather(-1, sampled_image_tokens.unsqueeze(-1)).squeeze(-1)
-                selected_probs = torch.where(unknown_map, selected_probs, float("inf"))
+            # [B, L, C]
+            probs = torch.log_softmax(logits, dim=-1)
+            # [B, L]
+            selected_probs = probs.gather(-1, sampled_image_tokens.unsqueeze(-1)).squeeze(-1)
+            selected_probs = torch.where(unknown_map, selected_probs, float("inf"))
 
-                gumbel_noise = torch.distributions.Gumbel(
-                    torch.tensor(0.0, device=device, dtype=selected_probs.dtype),
-                    torch.tensor(1.0, device=device, dtype=selected_probs.dtype),
-                ).sample(selected_probs.shape)
-                # [B, L]
-                noise_confidence = selected_probs + gumbel_noise * choice_temperature * (1.0 - t)
-                # calculate the cut-off w.r.t initial mask
-                # TODO: leaved for bar here
-                cut_off_len = (mask_ratio * mask.sum(dim=1)).int()
-                # cut_off_len = (mask_ratio * torch.ones_like(mask).sum(dim=1)).int()
-                # Keeps at least one of prediction in this round and also masks out at least
-                # one and for the next iteration
-                cut_off_len = torch.maximum(
-                    torch.ones_like(cut_off_len),
-                    torch.minimum(torch.sum(unknown_map, dim=-1) - 1, cut_off_len),
-                )
-                # NOTE: comment out of DDL
-                # assert all(
-                #     cut_off_len[0].allclose(cut_off_len[i]) for i in range(batch_size)
-                # ), "cut_off_len should be same for all images in batch"
-                cut_off_thresh = cut_off_len[0].item() / mask.shape[1] + 1e-6
+            gumbel_noise = torch.distributions.Gumbel(
+                torch.tensor(0.0, device=device, dtype=selected_probs.dtype),
+                torch.tensor(1.0, device=device, dtype=selected_probs.dtype),
+            ).sample(selected_probs.shape)
+            # [B, L]
+            noise_confidence = selected_probs + gumbel_noise * choice_temperature * (1.0 - t)
+            # calculate the cut-off w.r.t initial mask
+            # TODO: leaved for bar here
+            cut_off_len = (mask_ratio * mask.sum(dim=1)).int()
+            # cut_off_len = (mask_ratio * torch.ones_like(mask).sum(dim=1)).int()
+            # Keeps at least one of prediction in this round and also masks out at least
+            # one and for the next iteration
+            cut_off_len = torch.maximum(
+                torch.ones_like(cut_off_len),
+                torch.minimum(torch.sum(unknown_map, dim=-1) - 1, cut_off_len),
+            )
+            # NOTE: comment out of DDL
+            # assert all(
+            #     cut_off_len[0].allclose(cut_off_len[i]) for i in range(batch_size)
+            # ), "cut_off_len should be same for all images in batch"
+            cut_off_thresh = cut_off_len[0].item() / mask.shape[1] + 1e-6
 
-                cut_off = torch.quantile(noise_confidence, cut_off_thresh, dim=1, keepdim=True)
-                unknown_map &= noise_confidence < cut_off
+            cut_off = torch.quantile(noise_confidence, cut_off_thresh, dim=1, keepdim=True)
+            unknown_map &= noise_confidence < cut_off
 
-                masked_image_latents, _, ids_restore = self.scheduler.det_masking_token_min(
-                    image_latents, unknown_map.to(logits.dtype)
-                )
+            masked_image_latents, _, ids_restore = self.scheduler.det_masking_token_min(
+                image_latents, unknown_map.to(logits.dtype)
+            )
 
-                # call the callback, if provided
-                progress_bar.update()
-                if callback is not None and i % callback_steps == 0:
-                    callback(i, t, image_tokens)
+            # call the callback, if provided
+            if callback is not None and i % callback_steps == 0:
+                callback(i, t, image_tokens)
 
         image_tokens = image_tokens.view(
             batch_size,
@@ -879,4 +883,70 @@ class IMProvPipeline(DiffusionPipeline):
         if not return_dict:
             return (image,)
 
-        return ImagePipelineOutput(images=image)
+        return ImagePipelineOutput(images=image), latents_holder
+
+
+def forward_specc(self, x, ids_restore, encoder_hidden_states=None, d_vec=None):
+
+        x = self.emb(x)
+        with_cls_token = self.cls_token is not None
+        # append cls token
+        if with_cls_token:
+            cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
+
+        # apply Transformer blocks
+        for blk in self.encoder_blocks:
+            if self.encoder_cross_attention_cat_encoder:
+                x = blk(
+                    x,
+                    encoder_hidden_states=torch.cat(
+                        [encoder_hidden_states, self.encoder_cross_attn_proj(x)], dim=1
+                    ),
+                )
+            else:
+                x = blk(x, encoder_hidden_states=encoder_hidden_states)
+        x = self.encoder_norm(x)
+
+        if self.decoder_cross_attention_cat_encoder:
+            encoder_cross_attn_x = self.encoder_cross_attn_proj(x)
+            encoder_hidden_states = torch.cat([encoder_hidden_states, encoder_cross_attn_x], dim=1)
+
+        # embed tokens
+        x = self.decoder_embed(x)
+
+        # append mask tokens to sequence
+        cls_token_offset = 1 if with_cls_token else 0
+        mask_tokens = self.mask_token.repeat(
+            x.shape[0], ids_restore.shape[1] + cls_token_offset - x.shape[1], 1
+        )
+        x_ = torch.cat([x[:, cls_token_offset:, :], mask_tokens], dim=1)  # no cls token
+        x_ = torch.gather(
+            x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2])
+        )  # unshuffle
+
+        # we assume the position encoding of [CLS] token is zero
+        x_ = self.decoder_pos_embed(x_)
+
+        x = torch.cat([x[:, :cls_token_offset, :], x_], dim=1)  # append cls token
+
+        latents_holder = []
+        # apply Transformer blocks
+        for block_num, blk in enumerate(self.decoder_blocks):
+            x = blk(x, encoder_hidden_states=encoder_hidden_states)
+            if d_vec is not None:
+                assert d_vec.shape[1] == 197, d_vec.shape
+                assert x.shape == d_vec[block_num].unsqueeze(0).shape, (x.shape, d_vec.shape)
+                x = x + d_vec[block_num].unsqueeze(0)
+                
+            latents_holder.append(x.detach().cpu().numpy())
+
+        x = self.decoder_norm(x)
+
+        # predictor projection
+        x = self.decoder_pred(x)
+
+        # remove cls token
+        x = x[:, cls_token_offset:, :]
+
+        return x, latents_holder

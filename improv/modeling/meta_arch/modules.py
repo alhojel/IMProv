@@ -310,7 +310,7 @@ class TransformerMAE(ModelMixin, ConfigMixin):
         self.encoder_cross_attention_cat_encoder = encoder_cross_attention_cat_encoder
         self.decoder_cross_attention_cat_encoder = decoder_cross_attention_cat_encoder
 
-    def forward(self, x, ids_restore, encoder_hidden_states=None):
+    def forward(self, x, ids_restore, encoder_hidden_states=None, d_vec=None):
 
         x = self.emb(x)
         with_cls_token = self.cls_token is not None
@@ -354,9 +354,19 @@ class TransformerMAE(ModelMixin, ConfigMixin):
 
         x = torch.cat([x[:, :cls_token_offset, :], x_], dim=1)  # append cls token
 
+        latents_holder = []
+
         # apply Transformer blocks
-        for blk in self.decoder_blocks:
+        for block_num, blk in enumerate(self.decoder_blocks):
+            import pdb; breakpoint()
             x = blk(x, encoder_hidden_states=encoder_hidden_states)
+            if d_vec is not None:
+                assert d_vec.shape[1] == 197
+                assert x.shape == d_vec[block_num].unsqueeze(0).shape
+                x = x + d_vec[block_num].unsqueeze(0)
+                
+            latents_holder.append(x.detach().cpu().numpy())
+
         x = self.decoder_norm(x)
 
         # predictor projection
@@ -365,7 +375,7 @@ class TransformerMAE(ModelMixin, ConfigMixin):
         # remove cls token
         x = x[:, cls_token_offset:, :]
 
-        return x
+        return x, latents_holder
 
 
 class BasicTransformerBlockInContext(BasicTransformerBlock):
