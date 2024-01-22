@@ -595,6 +595,7 @@ class IMProvPipeline(DiffusionPipeline):
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         d_vec = None,
+        text_vec = None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -775,7 +776,8 @@ class IMProvPipeline(DiffusionPipeline):
                 token_model_input,
                 ids_restore=ids_restore,
                 encoder_hidden_states=prompt_embeds,
-                d_vec = d_vec
+                d_vec = d_vec,
+                text_vec = text_vec
             )
 
             # perform guidance
@@ -886,7 +888,7 @@ class IMProvPipeline(DiffusionPipeline):
         return ImagePipelineOutput(images=image), latents_holder
 
 
-def forward_specc(self, x, ids_restore, encoder_hidden_states=None, d_vec=None):
+def forward_specc(self, x, ids_restore, encoder_hidden_states=None, d_vec=None, text_vec=None):
 
         x = self.emb(x)
         with_cls_token = self.cls_token is not None
@@ -931,15 +933,22 @@ def forward_specc(self, x, ids_restore, encoder_hidden_states=None, d_vec=None):
         x = torch.cat([x[:, :cls_token_offset, :], x_], dim=1)  # append cls token
 
         latents_holder = []
+        
+        if text_vec is not None:
+            assert text_vec.shape == encoder_hidden_states.shape, (encoder_hidden_states.shape, text_vec.shape)
+            encoder_hidden_states = encoder_hidden_states + text_vec
+       
         # apply Transformer blocks
         for block_num, blk in enumerate(self.decoder_blocks):
             x = blk(x, encoder_hidden_states=encoder_hidden_states)
+            
             if d_vec is not None:
-                assert d_vec.shape[1] == 197, d_vec.shape
-                assert x.shape == d_vec[block_num].unsqueeze(0).shape, (x.shape, d_vec.shape)
-                x = x + d_vec[block_num].unsqueeze(0)
-                
+                assert x.shape == d_vec[block_num].shape, (x.shape, d_vec.shape)
+                x = x + d_vec[block_num]
+
             latents_holder.append(x.detach().cpu().numpy())
+
+        latents_holder.append(encoder_hidden_states.detach().cpu().numpy())
 
         x = self.decoder_norm(x)
 
